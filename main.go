@@ -24,30 +24,42 @@ type serverState string
 
 const (
 	idle     = "idle"
+	starting = "starting"
 	running  = "running"
 	stopping = "stopping"
 	crashed  = "crashed"
 )
 
-type serverOpCode int
+type serverRequestOpCode int
 
 const (
-	reqStart serverOpCode = iota
-	reqStop
-	reqStatus
-	reqLogs
-	stopped
-	noOp
+	start serverRequestOpCode = iota
+	stop
+	kill
+	logs
+	status
 )
 
-type serverOp struct {
-	op   serverOpCode
+type serverResponseOpCode int
+
+const (
+	started serverResponseOpCode = iota
+	stopped
+)
+
+type serverRequestOp struct {
+	op   serverRequestOpCode
 	args map[string]string
+}
+
+type serverResponseOp struct {
+	op serverResponseOpCode
 }
 
 type server struct {
 	StartedOn time.Time
 	Stop      func()
+	Kill      func()
 }
 
 func parseArgString(argString string, argFlags []string) (map[string]string, error) {
@@ -110,7 +122,7 @@ func readLastLines(bytes []byte, l int, o int) string {
 	return strings.Join(lines[firstLineIndex:lastLineIndex], "\n")
 }
 
-func startServer(signals chan<- *serverOp) *server {
+func startServer(notify chan<- *serverResponseOp) *server {
 	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms1024M", "-jar", "server.jar", "nogui")
 	pwd, err := os.Getwd()
 	check(err)
@@ -125,6 +137,8 @@ func startServer(signals chan<- *serverOp) *server {
 	check(err)
 
 	now := time.Now()
+	portPollSucceeded := make(chan bool)
+	abortPortPolling := make(chan bool)
 
 	go func() {
 		logFile.WriteString("\n\n=== BEGIN BB SESSION " + now.String() + " ===\n\n\n")
@@ -132,7 +146,40 @@ func startServer(signals chan<- *serverOp) *server {
 		serverCmd.Wait()
 
 		logFile.Close()
-		signals <- &serverOp{op: stopped}
+		notify <- &serverResponseOp{op: stopped}
+	}()
+
+	go func() {
+		for {
+			pingPortCmd := exec.Command("/bin/sh", "-c", "sudo lsof -i -P -n | grep 'TCP \\*:25565 (LISTEN)'")
+			resp, err := pingPortCmd.CombinedOutput()
+			fmt.Println(resp, err)
+
+			bound := err == nil && len(resp) > 0
+			portPollSucceeded <- bound
+			if bound {
+				fmt.Println("polled for port - success!")
+				return
+			}
+			fmt.Println("polled for port - failed")
+			time.Sleep(5 * time.Second)
+
+		}
+
+	}()
+
+	go func() {
+		for {
+			select {
+			case portWasBound := <-portPollSucceeded:
+				if portWasBound {
+					notify <- &serverResponseOp{op: started}
+					return
+				}
+			case <-abortPortPolling:
+				return
+			}
+		}
 	}()
 
 	return &server{
@@ -141,133 +188,152 @@ func startServer(signals chan<- *serverOp) *server {
 			serverInputPipe.Write([]byte("stop\n"))
 			serverInputPipe.Close()
 		},
+		Kill: func() {
+			abortPortPolling <- true
+			serverCmd.Process.Kill()
+		},
 	}
 
 }
 
-func makeServerManager(serverChan chan *serverOp, discordChan chan<- string) {
+func makeServerManager(serverRequests <-chan *serverRequestOp, discordResponses chan<- string) {
 	var state serverState = idle
 	var server *server
+	serverResponses := make(chan *serverResponseOp)
 
 	incomingArrow := "-> "
 	outgoingArrow := "<- "
 	for {
-		serverOperation := <-serverChan
-		switch serverOperation.op {
-		case reqStart:
-			fmt.Println(incomingArrow + "op: reqStart")
-			if state == idle || state == crashed {
+		select {
+		case serverRequest := <-serverRequests:
+			switch serverRequest.op {
+			case start:
+				fmt.Println(incomingArrow + "request: start")
+				if state == idle || state == crashed {
+					state = starting
+					server = startServer(serverResponses)
+					msg := "SERVER IS STARTING. WAIT FOR START MESSAGE TO JOIN."
+
+					fmt.Println(outgoingArrow + msg)
+					discordResponses <- msg
+				} else if state == running || state == starting {
+					msg := "ERROR: server is already running; you cannot start it"
+
+					fmt.Println(outgoingArrow + msg)
+					discordResponses <- msg
+				} else if state == stopping {
+					msg := "ERROR: server is shutting down; wait for it to stop before restarting it"
+
+					fmt.Println(outgoingArrow + msg)
+					discordResponses <- msg
+				}
+				break
+			case stop:
+				fmt.Println(incomingArrow + "request: stop")
+				if state == running && server != nil {
+					state = stopping
+					server.Stop()
+					msg := "STOPPING SERVER"
+
+					fmt.Println(outgoingArrow + msg)
+					discordResponses <- msg
+				} else {
+					msg := "ERROR: server is not running; it cannot be stopped"
+
+					fmt.Println(outgoingArrow + msg)
+					discordResponses <- msg
+				}
+				break
+			case kill:
+				if server != nil {
+					state = stopping
+					server.Kill()
+					server = nil
+				}
+				fmt.Println(incomingArrow, "request: kill")
+				break
+			case status:
+				var msg string
+				fmt.Println(incomingArrow + "request: status")
+				if state == running {
+					msg = "SERVER IS RUNNING. BLOC AWAY, MY BOIS.\n" + "server started on " + server.StartedOn.String()
+				} else if state == starting {
+					msg = "SERVER IS STARTING UP. BE PATIENT. I WILL NOTIFY WHEN ITS READY."
+				} else if state == idle {
+					msg = "SERVER IS NOT RUNNING. TELL ME TO START IT. COME ON. I WANT YOU TO DO IT."
+				} else if state == crashed {
+					msg = "SHIT. SERVER HAS CRASHED. I HAVE NO ANSWERS. ONLY PAIN."
+				} else if state == stopping {
+					msg = "SERVER IS SHUTTING DOWN. IT IS A FAR BETTER REST THAT I GO TO THAN I HAVE EVER KNOWN."
+				}
+				fmt.Println(outgoingArrow + "STATUS: " + msg)
+				discordResponses <- msg
+				break
+			case logs:
+				fmt.Println(incomingArrow + "request: logs")
+				if state == running && server != nil {
+					// TODO: figure this shit out
+					msg := "ERROR: cannot get logs - server is running; stop and try again to see logs"
+
+					fmt.Println(outgoingArrow + msg)
+					discordResponses <- msg
+				} else {
+					l, err := ioutil.ReadFile("bb-logs")
+					if err != nil {
+						fmt.Println("AH ERROR", err)
+					}
+					logLimit := 5
+					logOffset := 0
+
+					logLimitArg := serverRequest.args["l"]
+					if parsedLogLimit, _ := strconv.Atoi(logLimitArg); parsedLogLimit > 0 {
+						logLimit = parsedLogLimit
+					}
+
+					logOffsetArg := serverRequest.args["o"]
+					if parsedLogOffset, _ := strconv.Atoi(logOffsetArg); parsedLogOffset > 0 {
+						logOffset = parsedLogOffset
+					}
+
+					truncatedLogs := readLastLines(l, logLimit, logOffset)
+					msg := "sending logs:\n" + truncatedLogs + "\n"
+
+					fmt.Println(outgoingArrow + msg)
+					discordResponses <- truncatedLogs
+				}
+				break
+			}
+		case serverResponse := <-serverResponses:
+			switch serverResponse.op {
+			case started:
 				state = running
-				server = startServer(serverChan)
-				msg := "SERVER STARTED"
+				fmt.Println("<> server has started")
 
+				msg := "SERVER IS READY. BLOC AWAY MY BOIS."
 				fmt.Println(outgoingArrow + msg)
-				discordChan <- msg
-			} else if state == running {
-				msg := "ERROR: server is already running; you cannot start it"
-
-				fmt.Println(outgoingArrow + msg)
-				discordChan <- msg
-			} else if state == stopping {
-				msg := "ERROR: server is shutting down; wait for it to stop before restarting it"
-
-				fmt.Println(outgoingArrow + msg)
-				discordChan <- msg
-			}
-			break
-		case reqStop:
-			fmt.Println(incomingArrow + "op: reqStop")
-			if state == running && server != nil {
-				state = stopping
-				server.Stop()
-				msg := "SERVER STOPPED"
-
-				fmt.Println(outgoingArrow + msg)
-				discordChan <- msg
-			} else {
-				msg := "ERROR: server is not running; it cannot be stopped"
-
-				fmt.Println(outgoingArrow + msg)
-				discordChan <- msg
-			}
-			break
-		case reqStatus:
-			fmt.Println(incomingArrow + "op: reqStatus")
-			if state == running {
-				msg := "SERVER IS RUNNING. BLOC AWAY, MY BOIS.\n" + "server started on " + server.StartedOn.String()
-
-				fmt.Println(outgoingArrow + "STATUS: " + msg)
-				discordChan <- msg
-			} else if state == idle {
-				msg := "SERVER IS NOT RUNNING. TELL ME TO START IT. COME ON. I WANT YOU TO DO IT."
-
-				fmt.Println(outgoingArrow + "STATUS: " + msg)
-				discordChan <- msg
-			} else if state == crashed {
-				msg := "SHIT. SERVER HAS CRASHED. I HAVE NO ANSWERS. ONLY PAIN."
-
-				fmt.Println(outgoingArrow + "STATUS: " + msg)
-				discordChan <- msg
-			} else if state == stopping {
-				msg := "SERVER IS SHUTTING DOWN. IT IS A FAR BETTER REST THAT I GO TO THAN I HAVE EVER KNOWN."
-
-				fmt.Println(outgoingArrow + "STATUS: " + msg)
-				discordChan <- msg
-			}
-			break
-		case reqLogs:
-			fmt.Println(incomingArrow + "op: reqLogs")
-			if state == running && server != nil {
-				// TODO: figure this shit out
-				msg := "ERROR: cannot get logs - server is running; stop and try again to see logs"
-
-				fmt.Println(outgoingArrow + msg)
-				discordChan <- msg
-			} else {
-				logs, err := ioutil.ReadFile("bb-logs")
-				if err != nil {
-					fmt.Println("AH ERROR", err)
+				discordResponses <- msg
+			case stopped:
+				fmt.Println("<> server has stopped")
+				var msg string
+				if state == stopping {
+					state = idle
+					msg = "SERVER HAS STOPPED."
+				} else {
+					state = crashed
+					msg = "SHIT. SERVER HAS CRASHED."
 				}
-				logLimit := 5
-				logOffset := 0
-
-				logLimitArg := serverOperation.args["l"]
-				if parsedLogLimit, _ := strconv.Atoi(logLimitArg); parsedLogLimit > 0 {
-					logLimit = parsedLogLimit
-				}
-
-				logOffsetArg := serverOperation.args["o"]
-				if parsedLogOffset, _ := strconv.Atoi(logOffsetArg); parsedLogOffset > 0 {
-					logOffset = parsedLogOffset
-				}
-
-				truncatedLogs := readLastLines(logs, logLimit, logOffset)
-				msg := "sending logs:\n" + truncatedLogs + "\n"
+				server = nil
 
 				fmt.Println(outgoingArrow + msg)
-				discordChan <- truncatedLogs
+				discordResponses <- msg
+				break
 			}
-			break
-		case stopped:
-			fmt.Println(incomingArrow + "op: stopped")
-			var msg string
-			if state == stopping {
-				state = idle
-				msg = "SERVER HAS STOPPED."
-			} else {
-				state = crashed
-				msg = "SHIT. SERVER HAS CRASHED."
-			}
-			server = nil
 
-			fmt.Println(outgoingArrow + msg)
-			discordChan <- msg
-			break
 		}
 	}
 }
 
-func makeBotManager(serverChan chan<- *serverOp, discordChan chan string) {
+func makeBotManager(serverRequests chan<- *serverRequestOp, discordResponses chan string) {
 	bg := context.Background()
 	client := disgord.New(disgord.Config{
 		BotToken: os.Getenv("BOT_TOKEN"),
@@ -286,30 +352,32 @@ func makeBotManager(serverChan chan<- *serverOp, discordChan chan string) {
 		}
 		if !msg.Author.Bot && strings.HasPrefix(msg.Content, "!bb ") {
 			cmd := msg.Content[4:]
-			op := noOp
-			var args map[string]string = nil
+			var op *serverRequestOp
 			if cmd == "start" {
-				op = reqStart
+				op = &serverRequestOp{op: start}
 			} else if cmd == "stop" {
-				op = reqStop
+				op = &serverRequestOp{op: stop}
+			} else if cmd == "kill" {
+				op = &serverRequestOp{op: kill}
 			} else if cmd == "status" {
-				op = reqStatus
+				op = &serverRequestOp{op: status}
 			} else if strings.HasPrefix(cmd, "logs") {
-				op = reqLogs
+				op = &serverRequestOp{op: logs}
 				argString := cmd[4:]
 				var validFlags = []string{"l", "o"}
 				compiledArgs, err := parseArgString(argString, validFlags)
 				if err != nil {
+					op = nil
 					fmt.Println(err)
-					op = noOp
+				} else {
+					op.args = compiledArgs
 				}
-				args = compiledArgs
 			}
 
-			if op != noOp {
-				serverChan <- &serverOp{op: op, args: args}
+			if op != nil {
+				serverRequests <- op
 			} else {
-				discordChan <- "ERROR: command \"" + cmd + "\" not recognized. get it together."
+				discordResponses <- "ERROR: command \"" + cmd + "\" not recognized. get it together."
 			}
 		}
 	}
@@ -319,7 +387,7 @@ func makeBotManager(serverChan chan<- *serverOp, discordChan chan string) {
 
 	go func() {
 		for {
-			discordMsg := <-discordChan
+			discordMsg := <-discordResponses
 			client.CreateMessage(bg, channelID, &disgord.CreateMessageParams{
 				Content: discordMsg,
 			})
@@ -328,9 +396,9 @@ func makeBotManager(serverChan chan<- *serverOp, discordChan chan string) {
 }
 
 func main() {
-	serverChan := make(chan *serverOp)
-	discordChan := make(chan string)
+	serverRequests := make(chan *serverRequestOp)
+	discordResponses := make(chan string)
 
-	go makeServerManager(serverChan, discordChan)
-	makeBotManager(serverChan, discordChan)
+	go makeServerManager(serverRequests, discordResponses)
+	makeBotManager(serverRequests, discordResponses)
 }
