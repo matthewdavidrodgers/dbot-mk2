@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,33 +29,88 @@ const (
 	crashed  = "crashed"
 )
 
-type serverOp int
+type serverOpCode int
 
 const (
-	reqStart serverOp = iota
+	reqStart serverOpCode = iota
 	reqStop
 	reqStatus
 	reqLogs
 	stopped
+	noOp
 )
+
+type serverOp struct {
+	op   serverOpCode
+	args map[string]string
+}
 
 type server struct {
 	StartedOn time.Time
 	Stop      func()
 }
 
-func readLastNLines(bytes []byte, n int) string {
-	lines := strings.Split(string(bytes), "\n")
-	var nLines []string
-	if len(lines) <= n {
-		nLines = lines
-	} else {
-		nLines = lines[len(lines)-n-1:]
+func parseArgString(argString string, argFlags []string) (map[string]string, error) {
+	args := make(map[string]string, len(argFlags))
+	e := errors.New("ERROR: malformed argString")
+
+	idx := 0
+	for idx < len(argString) {
+		charByte := argString[idx]
+		char := string(charByte)
+		if char == " " {
+			idx++
+			continue
+		}
+		if char == "-" {
+			if idx+1 == len(argString) {
+				return nil, e
+			}
+			flagByte := argString[idx+1]
+			if !((flagByte >= 65 && flagByte <= 90) || (flagByte >= 97 && flagByte <= 122)) {
+				return nil, e
+			}
+			flag := string(flagByte)
+
+			if idx+2 == len(argString) || string(argString[idx+2]) != "=" {
+				return nil, e
+			}
+
+			innerIdx := idx + 3
+			flagValue := make([]byte, 0)
+			for innerIdx < len(argString) {
+				innerCharByte := argString[innerIdx]
+				innerChar := string(innerCharByte)
+
+				if innerChar == " " {
+					break
+				}
+				flagValue = append(flagValue, innerCharByte)
+				innerIdx++
+			}
+			if len(flagValue) == 0 {
+				return nil, e
+			}
+			args[flag] = string(flagValue)
+			idx = innerIdx + 1
+			continue
+		}
+		return nil, e
 	}
-	return strings.Join(nLines, "\n")
+	return args, nil
 }
 
-func startServer(signals chan<- serverOp) *server {
+func readLastLines(bytes []byte, l int, o int) string {
+	lines := strings.Split(string(bytes), "\n")
+	firstLineIndex := len(lines) - l - o
+	lastLineIndex := len(lines) - o
+	if firstLineIndex < 0 {
+		firstLineIndex = 0
+	}
+	return strings.Join(lines[firstLineIndex:lastLineIndex], "\n")
+}
+
+func startServer(signals chan<- *serverOp) *server {
 	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms1024M", "-jar", "server.jar", "nogui")
 	pwd, err := os.Getwd()
 	check(err)
@@ -75,7 +132,7 @@ func startServer(signals chan<- serverOp) *server {
 		serverCmd.Wait()
 
 		logFile.Close()
-		signals <- stopped
+		signals <- &serverOp{op: stopped}
 	}()
 
 	return &server{
@@ -88,15 +145,15 @@ func startServer(signals chan<- serverOp) *server {
 
 }
 
-func makeServerManager(serverChan chan serverOp, discordChan chan<- string) {
+func makeServerManager(serverChan chan *serverOp, discordChan chan<- string) {
 	var state serverState = idle
 	var server *server
 
 	incomingArrow := "-> "
 	outgoingArrow := "<- "
 	for {
-		serverOp := <-serverChan
-		switch serverOp {
+		serverOperation := <-serverChan
+		switch serverOperation.op {
 		case reqStart:
 			fmt.Println(incomingArrow + "op: reqStart")
 			if state == idle || state == crashed {
@@ -171,7 +228,20 @@ func makeServerManager(serverChan chan serverOp, discordChan chan<- string) {
 				if err != nil {
 					fmt.Println("AH ERROR", err)
 				}
-				truncatedLogs := readLastNLines(logs, 5)
+				logLimit := 5
+				logOffset := 0
+
+				logLimitArg := serverOperation.args["l"]
+				if parsedLogLimit, _ := strconv.Atoi(logLimitArg); parsedLogLimit > 0 {
+					logLimit = parsedLogLimit
+				}
+
+				logOffsetArg := serverOperation.args["o"]
+				if parsedLogOffset, _ := strconv.Atoi(logOffsetArg); parsedLogOffset > 0 {
+					logOffset = parsedLogOffset
+				}
+
+				truncatedLogs := readLastLines(logs, logLimit, logOffset)
 				msg := "sending logs:\n" + truncatedLogs + "\n"
 
 				fmt.Println(outgoingArrow + msg)
@@ -180,20 +250,24 @@ func makeServerManager(serverChan chan serverOp, discordChan chan<- string) {
 			break
 		case stopped:
 			fmt.Println(incomingArrow + "op: stopped")
+			var msg string
 			if state == stopping {
-				fmt.Println(outgoingArrow + "server has stopped")
 				state = idle
+				msg = "SERVER HAS STOPPED."
 			} else {
-				fmt.Println(outgoingArrow + "server has CRASHED")
 				state = crashed
+				msg = "SHIT. SERVER HAS CRASHED."
 			}
 			server = nil
+
+			fmt.Println(outgoingArrow + msg)
+			discordChan <- msg
 			break
 		}
 	}
 }
 
-func makeBotManager(serverChan chan<- serverOp, discordChan chan string) {
+func makeBotManager(serverChan chan<- *serverOp, discordChan chan string) {
 	bg := context.Background()
 	client := disgord.New(disgord.Config{
 		BotToken: os.Getenv("BOT_TOKEN"),
@@ -212,21 +286,29 @@ func makeBotManager(serverChan chan<- serverOp, discordChan chan string) {
 		}
 		if !msg.Author.Bot && strings.HasPrefix(msg.Content, "!bb ") {
 			cmd := msg.Content[4:]
-			switch cmd {
-			case "start":
-				serverChan <- reqStart
-				break
-			case "stop":
-				serverChan <- reqStop
-				break
-			case "status":
-				serverChan <- reqStatus
-				break
-			case "logs":
-				// TODO: compile flags for limit and offset (e.g. -l=10 -o=15)
-				serverChan <- reqLogs
-				break
-			default:
+			op := noOp
+			var args map[string]string = nil
+			if cmd == "start" {
+				op = reqStart
+			} else if cmd == "stop" {
+				op = reqStop
+			} else if cmd == "status" {
+				op = reqStatus
+			} else if strings.HasPrefix(cmd, "logs") {
+				op = reqLogs
+				argString := cmd[4:]
+				var validFlags = []string{"l", "o"}
+				compiledArgs, err := parseArgString(argString, validFlags)
+				if err != nil {
+					fmt.Println(err)
+					op = noOp
+				}
+				args = compiledArgs
+			}
+
+			if op != noOp {
+				serverChan <- &serverOp{op: op, args: args}
+			} else {
 				discordChan <- "ERROR: command \"" + cmd + "\" not recognized. get it together."
 			}
 		}
@@ -246,7 +328,7 @@ func makeBotManager(serverChan chan<- serverOp, discordChan chan string) {
 }
 
 func main() {
-	serverChan := make(chan serverOp)
+	serverChan := make(chan *serverOp)
 	discordChan := make(chan string)
 
 	go makeServerManager(serverChan, discordChan)
