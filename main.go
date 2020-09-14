@@ -38,6 +38,7 @@ const (
 	kill
 	logs
 	status
+	noOp
 )
 
 type serverResponseOpCode int
@@ -123,7 +124,7 @@ func readLastLines(bytes []byte, l int, o int) string {
 }
 
 func startServer(notify chan<- *serverResponseOp) *server {
-	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms1024M", "-jar", "server.jar", "nogui")
+	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms512M", "-jar", "server.jar", "--nogui", "--universe", "bb-worlds", "--world", "hyperion")
 	pwd, err := os.Getwd()
 	check(err)
 	serverCmd.Dir = pwd
@@ -153,7 +154,6 @@ func startServer(notify chan<- *serverResponseOp) *server {
 		for {
 			pingPortCmd := exec.Command("/bin/sh", "-c", "sudo lsof -i -P -n | grep 'TCP \\*:25565 (LISTEN)'")
 			resp, err := pingPortCmd.CombinedOutput()
-			fmt.Println(resp, err)
 
 			bound := err == nil && len(resp) > 0
 			portPollSucceeded <- bound
@@ -201,14 +201,12 @@ func makeServerManager(serverRequests <-chan *serverRequestOp, discordResponses 
 	var server *server
 	serverResponses := make(chan *serverResponseOp)
 
-	incomingArrow := "-> "
 	outgoingArrow := "<- "
 	for {
 		select {
 		case serverRequest := <-serverRequests:
 			switch serverRequest.op {
 			case start:
-				fmt.Println(incomingArrow + "request: start")
 				if state == idle || state == crashed {
 					state = starting
 					server = startServer(serverResponses)
@@ -229,7 +227,6 @@ func makeServerManager(serverRequests <-chan *serverRequestOp, discordResponses 
 				}
 				break
 			case stop:
-				fmt.Println(incomingArrow + "request: stop")
 				if state == running && server != nil {
 					state = stopping
 					server.Stop()
@@ -250,11 +247,9 @@ func makeServerManager(serverRequests <-chan *serverRequestOp, discordResponses 
 					server.Kill()
 					server = nil
 				}
-				fmt.Println(incomingArrow, "request: kill")
 				break
 			case status:
 				var msg string
-				fmt.Println(incomingArrow + "request: status")
 				if state == running {
 					msg = "SERVER IS RUNNING. BLOC AWAY, MY BOIS.\n" + "server started on " + server.StartedOn.String()
 				} else if state == starting {
@@ -270,7 +265,6 @@ func makeServerManager(serverRequests <-chan *serverRequestOp, discordResponses 
 				discordResponses <- msg
 				break
 			case logs:
-				fmt.Println(incomingArrow + "request: logs")
 				if state == running && server != nil {
 					// TODO: figure this shit out
 					msg := "ERROR: cannot get logs - server is running; stop and try again to see logs"
@@ -334,6 +328,19 @@ func makeServerManager(serverRequests <-chan *serverRequestOp, discordResponses 
 }
 
 func makeBotManager(serverRequests chan<- *serverRequestOp, discordResponses chan string) {
+	helpText :=
+		`Issue a command by messaging the bot with "!bb <your command>"
+e.g. if you wanted to start the server: "!bb start"
+
+COMMANDS
+- start : start the server if it hasn't been running. it won't immediately be available - the bot will message you when its ready
+- stop : safely stop a running server
+- kill : unsafely stop a running or starting server (be careful, this could corrupt the minecraft world)
+- status : report on the status of the server
+- address : get the public dns address of the server (what you'll use to connect to it)
+- help : list available commands 
+`
+
 	bg := context.Background()
 	client := disgord.New(disgord.Config{
 		BotToken: os.Getenv("BOT_TOKEN"),
@@ -361,6 +368,13 @@ func makeBotManager(serverRequests chan<- *serverRequestOp, discordResponses cha
 				op = &serverRequestOp{op: kill}
 			} else if cmd == "status" {
 				op = &serverRequestOp{op: status}
+			} else if cmd == "address" {
+				dns := os.Getenv("PUBLIC_DNS")
+				discordResponses <- "SERVER LISTENING FROM " + dns
+				op = &serverRequestOp{op: noOp}
+			} else if cmd == "help" {
+				discordResponses <- helpText
+				op = &serverRequestOp{op: noOp}
 			} else if strings.HasPrefix(cmd, "logs") {
 				op = &serverRequestOp{op: logs}
 				argString := cmd[4:]
@@ -375,7 +389,10 @@ func makeBotManager(serverRequests chan<- *serverRequestOp, discordResponses cha
 			}
 
 			if op != nil {
-				serverRequests <- op
+				fmt.Println("<- request: " + cmd)
+				if op.op != noOp {
+					serverRequests <- op
+				}
 			} else {
 				discordResponses <- "ERROR: command \"" + cmd + "\" not recognized. get it together."
 			}
