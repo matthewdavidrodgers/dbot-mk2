@@ -1,5 +1,9 @@
 package mcserver
 
+type op struct {
+	Args map[string]string
+}
+
 // ServerRequestOpCode is an int describing the operation type in a server request
 type ServerRequestOpCode int
 
@@ -14,14 +18,16 @@ const (
 	Logs
 	// Status describes a request to get the current status of a server
 	Status
-	// NoOp is an operation that is ignored by the server manager
-	NoOp
+	// Address describes a request to get the public DNS with which to connect to the server
+	Address
+	// Help describes a request to get the available commands and other help for the bot
+	Help
 )
 
 // ServerRequestOp is a unit describing an operation in a server request
 type ServerRequestOp struct {
+	op
 	Code ServerRequestOpCode
-	Args map[string]string
 }
 
 // ServerResponseOpCode is an int describing the update type in a server response
@@ -34,5 +40,6 @@ const (
 
 // ServerResponseOp is a unit describing an update in a server response
 type ServerResponseOp struct {
+	op
 	Code ServerResponseOpCode
 }

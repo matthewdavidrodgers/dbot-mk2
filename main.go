@@ -9,6 +9,6 @@ func main() {
 	serverRequests := make(chan *mcserver.ServerRequestOp)
 	discordResponses := make(chan string)
 
-	go mcserver.MakeServerManager(serverRequests, discordResponses)
+	mcserver.MakeServerManager(serverRequests, discordResponses)
 	dbot.MakeBotManager(serverRequests, discordResponses)
 }
