@@ -54,7 +54,7 @@ func getWorlds() ([]bbWorld, error) {
 	worlds := make([]bbWorld, 0, len(dir))
 	for _, world := range dir {
 		name := world.Name()
-		path := filepath.Join(pwd, "bb-worlds", name)
+		path := filepath.Join(pwd, "bb-worlds", name, "server.properties")
 		mode, err := utils.GetNamedValueInTextFile(path, "gamemode")
 		if err != nil {
 			return nil, err

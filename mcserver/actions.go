@@ -159,7 +159,7 @@ var listServerRequestAction = func(m *manager, args map[string]string) string {
 
 	resp := "AVAILABLE WORLDS:\n"
 	for _, world := range worlds {
-		resp += fmt.Sprintf("\n%s (%s)", world.mode, world.mode)
+		resp += fmt.Sprintf("\n%s (%s)", world.name, world.mode)
 	}
 
 	resp += "\n\nStart a world with the \"start\" command i.e. \"!bb start _my-world_\""
