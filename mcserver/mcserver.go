@@ -2,15 +2,19 @@ package mcserver
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
+	"github.com/matthewdavidrodgers/dbot-mk2/defs"
 	"github.com/matthewdavidrodgers/dbot-mk2/utils"
 )
 
 type server struct {
 	startedOn time.Time
+	worldName string
 	stop      func()
 	kill      func()
 }
@@ -28,11 +32,76 @@ const (
 type manager struct {
 	state           serverStateCode
 	server          *server
-	serverResponses chan *ServerResponseOp
+	serverResponses chan *defs.ServerResponseOp
 }
 
-func startServer(notify chan<- *ServerResponseOp) *server {
-	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms512M", "-jar", "server.jar", "--nogui", "--universe", "bb-worlds", "--world", "hyperion")
+type bbWorld struct {
+	name string
+	mode string
+}
+
+func getWorlds() ([]bbWorld, error) {
+	pwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
+	dir, err := ioutil.ReadDir(filepath.Join(pwd, "bb-worlds"))
+	if err != nil {
+		return nil, err
+	}
+
+	worlds := make([]bbWorld, 0, len(dir))
+	for _, world := range dir {
+		name := world.Name()
+		path := filepath.Join(pwd, "bb-worlds", name)
+		mode, err := utils.GetNamedValueInTextFile(path, "gamemode")
+		if err != nil {
+			return nil, err
+		}
+
+		worlds = append(worlds, bbWorld{name: name, mode: mode})
+	}
+
+	return worlds, nil
+}
+
+func createWorld(notify chan<- *defs.ServerResponseOp, name string, mode string) {
+	pwd, err := os.Getwd()
+	if err != nil {
+		notify <- &defs.ServerResponseOp{Code: defs.CreateWorldFailure}
+		return
+	}
+	path := filepath.Join(pwd, "bb-worlds", name)
+	err = os.Mkdir(path, 0755)
+	if err != nil {
+		notify <- &defs.ServerResponseOp{Code: defs.CreateWorldFailure}
+		return
+	}
+
+	jarFileLocation := filepath.Join(pwd, "server.jar")
+
+	createCmd := exec.Command("java", "-Xmx1024M", "-Xms512M", "-jar", jarFileLocation, "--nogui", "--initSettings")
+	createCmd.Dir = path
+
+	output, err := createCmd.CombinedOutput()
+	if err != nil {
+		fmt.Println(string(output))
+		notify <- &defs.ServerResponseOp{Code: defs.CreateWorldFailure}
+		return
+	}
+
+	utils.ReplaceNamedValueInTextFile(filepath.Join(path, "server.properties"), "gamemode", mode)
+	utils.ReplaceNamedValueInTextFile(filepath.Join(path, "eula.txt"), "eula", "true")
+
+	op := defs.ServerResponseOp{Code: defs.CreateWorldSuccess}
+	args := map[string]string{"name": name}
+	op.Args = args
+	notify <- &op
+}
+
+func startServer(notify chan<- *defs.ServerResponseOp, world string) *server {
+	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms512M", "-jar", "server.jar", "--nogui", "--universe", "bb-worlds", "--world", world)
 	pwd, err := os.Getwd()
 	utils.Check(err)
 	serverCmd.Dir = pwd
@@ -55,7 +124,7 @@ func startServer(notify chan<- *ServerResponseOp) *server {
 		serverCmd.Wait()
 
 		logFile.Close()
-		notify <- &ServerResponseOp{Code: stopped}
+		notify <- &defs.ServerResponseOp{Code: defs.Stopped}
 	}()
 
 	go func() {
@@ -81,7 +150,7 @@ func startServer(notify chan<- *ServerResponseOp) *server {
 			select {
 			case portWasBound := <-portPollSucceeded:
 				if portWasBound {
-					notify <- &ServerResponseOp{Code: started}
+					notify <- &defs.ServerResponseOp{Code: defs.Started}
 					return
 				}
 			case <-abortPortPolling:
@@ -92,6 +161,7 @@ func startServer(notify chan<- *ServerResponseOp) *server {
 
 	return &server{
 		startedOn: now,
+		worldName: world,
 		stop: func() {
 			serverInputPipe.Write([]byte("stop\n"))
 			serverInputPipe.Close()
@@ -105,8 +175,8 @@ func startServer(notify chan<- *ServerResponseOp) *server {
 }
 
 // MakeServerManager listens to the serverRequest channel and performs ops against a mc server, sending string updates to the discordMessages channel
-func MakeServerManager(serverRequests <-chan *ServerRequestOp, discordResponses chan<- string) {
-	serverResponses := make(chan *ServerResponseOp)
+func MakeServerManager(serverRequests <-chan *defs.ServerRequestOp, discordResponses chan<- string) {
+	serverResponses := make(chan *defs.ServerResponseOp)
 	serverManager := &manager{state: idle, server: nil, serverResponses: serverResponses}
 
 	go func() {

@@ -2,18 +2,41 @@ package dbot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/andersfylling/disgord"
-	"github.com/matthewdavidrodgers/dbot-mk2/mcserver"
+	"github.com/matthewdavidrodgers/dbot-mk2/defs"
+	"github.com/matthewdavidrodgers/dbot-mk2/utils"
 )
+
+func parseOp(message string, mcs []defs.MessageCommand) (*defs.ServerRequestOp, error) {
+	for _, mc := range mcs {
+		if message == mc.Command || strings.HasPrefix(message, mc.Command+" ") {
+			argString := message[len(mc.Command):]
+
+			compiledArgs, err := utils.ParseArgString(argString, mc.FlagArgs, mc.AllowUnnamedArg)
+			if err != nil {
+				fmt.Println(err)
+				e, ok := err.(*utils.InvalidFlagError)
+				if ok {
+					return nil, fmt.Errorf("flag \"%s\" is not allow for command \"%s\"", e.Found, mc.Command)
+				}
+				return nil, errors.New("i have literally no idea what that means")
+			}
+
+			return &defs.ServerRequestOp{Code: mc.RequestCode, Args: compiledArgs}, nil
+		}
+	}
+	return nil, fmt.Errorf("command \"%s\" is not recognized. get it together", message)
+}
 
 // MakeBotManager starts discord bot that listens to incoming messages, and sends ServerRequestOps when a valid
 // command is requested. it also sends messages back to the discord server based on the messages provided by the
 // discordResponses channel
-func MakeBotManager(serverRequests chan<- *mcserver.ServerRequestOp, discordResponses chan string) {
+func MakeBotManager(serverRequests chan<- *defs.ServerRequestOp, discordResponses chan string) {
 	bg := context.Background()
 	client := disgord.New(disgord.Config{
 		BotToken: os.Getenv("BOT_TOKEN"),
@@ -32,16 +55,12 @@ func MakeBotManager(serverRequests chan<- *mcserver.ServerRequestOp, discordResp
 		}
 		if !msg.Author.Bot && strings.HasPrefix(msg.Content, "!bb ") {
 			cmd := msg.Content[4:]
-			var op *mcserver.ServerRequestOp
-			for _, matcherHandler := range MatcherHandlers {
-				op = matcherHandler(cmd)
-				if op != nil {
-					fmt.Println("<- request: " + cmd)
-					serverRequests <- op
-					return
-				}
+			op, err := parseOp(cmd, defs.Commands)
+			if err != nil {
+				discordResponses <- "ERROR: " + err.Error()
+				return
 			}
-			discordResponses <- "ERROR: command \"" + cmd + "\" not recognized. get it together."
+			serverRequests <- op
 		}
 
 	}
