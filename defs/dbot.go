@@ -59,4 +59,9 @@ var Commands = []MessageCommand{
 		RequestCode: List,
 		HelpText:    "list : list the existing worlds",
 	},
+	{
+		Command:     "drew",
+		RequestCode: Drew,
+		HelpText:    "drew : ugh. he's saying dumb shit again, isn't he",
+	},
 }

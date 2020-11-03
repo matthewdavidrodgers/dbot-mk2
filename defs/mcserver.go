@@ -22,6 +22,8 @@ const (
 	Create
 	// List describes a request to list all existing worlds
 	List
+	// Drew describes a request to tell drew to shut up
+	Drew
 )
 
 // ServerRequestOp is a unit describing an operation in a server request

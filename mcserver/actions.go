@@ -166,6 +166,10 @@ var listServerRequestAction = func(m *manager, args map[string]string) string {
 	return resp
 }
 
+var drewServerRequestAction = func(m *manager, args map[string]string) string {
+	return "shut the fuck up drew"
+}
+
 var serverRequestActions = map[defs.ServerRequestOpCode]serverAction{
 	defs.Start:   startServerRequestAction,
 	defs.Stop:    stopServerRequestAction,
@@ -176,6 +180,7 @@ var serverRequestActions = map[defs.ServerRequestOpCode]serverAction{
 	defs.Help:    helpServerRequestAction,
 	defs.Create:  createServerRequestAction,
 	defs.List:    listServerRequestAction,
+	defs.Drew:    drewServerRequestAction,
 }
 
 var startedServerResponseAction = func(m *manager, args map[string]string) string {

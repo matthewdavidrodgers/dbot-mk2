@@ -51,16 +51,18 @@ func getWorlds() ([]bbWorld, error) {
 		return nil, err
 	}
 
-	worlds := make([]bbWorld, 0, len(dir))
+	worlds := make([]bbWorld, 0)
 	for _, world := range dir {
-		name := world.Name()
-		path := filepath.Join(pwd, "bb-worlds", name, "server.properties")
-		mode, err := utils.GetNamedValueInTextFile(path, "gamemode")
-		if err != nil {
-			return nil, err
-		}
+		if world.IsDir() {
+			name := world.Name()
+			path := filepath.Join(pwd, "bb-worlds", name, "server.properties")
+			mode, err := utils.GetNamedValueInTextFile(path, "gamemode")
+			if err != nil {
+				return nil, err
+			}
 
-		worlds = append(worlds, bbWorld{name: name, mode: mode})
+			worlds = append(worlds, bbWorld{name: name, mode: mode})
+		}
 	}
 
 	return worlds, nil
@@ -101,10 +103,10 @@ func createWorld(notify chan<- *defs.ServerResponseOp, name string, mode string)
 }
 
 func startServer(notify chan<- *defs.ServerResponseOp, world string) *server {
-	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms512M", "-jar", "server.jar", "--nogui", "--universe", "bb-worlds", "--world", world)
+	serverCmd := exec.Command("java", "-Xmx1024M", "-Xms512M", "-jar", "../../server.jar", "--nogui")
 	pwd, err := os.Getwd()
 	utils.Check(err)
-	serverCmd.Dir = pwd
+	serverCmd.Dir = filepath.Join(pwd, "bb-worlds", world)
 
 	logFile, err := os.OpenFile("bb-logs", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
 	utils.Check(err)
